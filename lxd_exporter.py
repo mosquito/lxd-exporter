@@ -5,16 +5,16 @@ import gevent
 from abc import ABC, abstractmethod
 from types import MappingProxyType
 import re
-from typing import Mapping, Iterable, Any
+from typing import Mapping, Iterable, Any, Optional
 
 import logging
 import os
 
 from flask import Flask
 from pylxd import Client
-from pylxd.models import Container, StoragePool, StorageResources
+from pylxd.models import Container, StoragePool, StorageResources, Profile
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
-from prometheus_client import make_wsgi_app, Gauge
+from prometheus_client import make_wsgi_app, Gauge, Counter as MetricCounter
 from gevent.pywsgi import WSGIServer
 from gevent import sleep
 
@@ -96,6 +96,12 @@ class ContainerDeviceCollector(CollectorBase):
 class StorageCollector(CollectorBase):
     @abstractmethod
     def update(self, storage: StoragePool):
+        pass
+
+
+class ProfileCollector(CollectorBase):
+    @abstractmethod
+    def update(self, profile: Profile):
         pass
 
 
@@ -204,18 +210,22 @@ class LimitsCPUEffectiveCollector(ContainerVirtualCollector):
         labelnames=("container", "location")
     )
 
-    def update(self, container: Container):
+    def get_cpu_limit(self, container: Container) -> Optional[int]:
         cpus = container.expanded_config.get("limits.cpu")
         allowance = container.expanded_config.get("limits.cpu.allowance")
 
         if cpus is None:
-            return
+            return None
 
         value = int(cpus)
-
         if allowance is not None:
             allowed, period = map(self.dehumanize_time, allowance.split("/", 1))
             value *= allowed / period
+
+        return value
+
+    def update(self, container: Container):
+        value = self.get_cpu_limit(container)
 
         self.METRIC.labels(
             container=container.name, location=container.location
@@ -298,9 +308,22 @@ class StorageResourceCollector(StorageCollector):
         self.METRIC_USED.labels(pool=storage.name).set(resources.space['used'])
 
 
+class ProfileUsageCollector(ProfileCollector):
+    METRIC_PROFILE = Gauge(
+        name="lxd_profile_usage_count",
+        documentation="Profile metrics",
+        labelnames=('profile',)
+    )
+
+    def update(self, profile: Profile):
+        self.METRIC_PROFILE.labels(profile=profile.name).set(len(profile.used_by))
+
+
 ContainersTotal = Gauge(
     "lxd_container_count", "Total container count", labelnames=("status",)
 )
+
+UpdateTime = MetricCounter("lxd_exporter_heartbeat", documentation="Last update since exporter start")
 
 
 CONTAINER_METRICS_REGISTRY: Mapping[str, ContainerCollector] = MappingProxyType({
@@ -326,6 +349,11 @@ CONTAINER_DEVICE_REGISTRY: Mapping[str, Iterable[ContainerDeviceCollector]] = Ma
 
 STORAGE_REGISTRY: Iterable[StorageCollector] = (
     StorageResourceCollector(),
+)
+
+
+PROFILES_REGISTRY: Iterable[ProfileCollector] = (
+    ProfileUsageCollector(),
 )
 
 
@@ -365,7 +393,19 @@ def collect():
 
     for storage in CLIENT.storage_pools.all():
         for storage_collector in STORAGE_REGISTRY:
-            storage_collector.update(storage)
+            try:
+                storage_collector.update(storage)
+            except Exception:
+                logging.exception("Failed to collect device %r with collector %r", name, device_collector)
+
+    for profile in CLIENT.profiles.all():
+        for profile_collector in PROFILES_REGISTRY:
+            try:
+                profile_collector.update(profile)
+            except Exception:
+                logging.exception("Failed to collect profile %r with collector %r", profile.name, profile_collector)
+
+    UpdateTime.inc(1)
 
 
 def collector():
