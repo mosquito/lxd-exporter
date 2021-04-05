@@ -288,25 +288,25 @@ class StateCollector(ContainerVirtualCollector):
         labelnames=("container", "location", "device", "family")
     )
 
-    METRIC_NETWORK_RX = MetricCounter(
+    METRIC_NETWORK_RX = Gauge(
         name="lxd_container_state_network_bytes_rx",
         documentation="Container network received bytes",
         labelnames=("container", "location", "device")
     )
 
-    METRIC_NETWORK_TX = MetricCounter(
+    METRIC_NETWORK_TX = Gauge(
         name="lxd_container_state_network_bytes_tx",
         documentation="Container network transmitted bytes",
         labelnames=("container", "location", "device")
     )
 
-    METRIC_NETWORK_PACKETS_RX = MetricCounter(
+    METRIC_NETWORK_PACKETS_RX = Gauge(
         name="lxd_container_state_network_packets_rx",
         documentation="Container network received packets",
         labelnames=("container", "location", "device")
     )
 
-    METRIC_NETWORK_PACKETS_TX = MetricCounter(
+    METRIC_NETWORK_PACKETS_TX = Gauge(
         name="lxd_container_state_network_packets_tx",
         documentation="Container network transmitted bytes",
         labelnames=("container", "location", "device")
@@ -331,16 +331,16 @@ class StateCollector(ContainerVirtualCollector):
         for name, usage in state.network.items():
             self.METRIC_NETWORK_RX.labels(
                 device=name, **labels
-            ).inc(usage['counters']['bytes_received'])
+            ).set(usage['counters']['bytes_received'])
             self.METRIC_NETWORK_TX.labels(
                 device=name, **labels
-            ).inc(usage['counters']['bytes_sent'])
+            ).set(usage['counters']['bytes_sent'])
             self.METRIC_NETWORK_PACKETS_RX.labels(
                 device=name, **labels
-            ).inc(usage['counters']['packets_received'])
+            ).set(usage['counters']['packets_received'])
             self.METRIC_NETWORK_PACKETS_TX.labels(
                 device=name, **labels
-            ).inc(usage['counters']['packets_sent'])
+            ).set(usage['counters']['packets_sent'])
             self.METRIC_IF_STATE.labels(
                 device=name, state=usage['state'], **labels
             ).set(1)
