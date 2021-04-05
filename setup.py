@@ -8,12 +8,13 @@ setup(
     license="Apache Software License",
     author="Dmitry Orlov",
     author_email="me@mosquito.su",
+    url="https://github.com/mosquito/lxd-exporter",
     project_urls={
         "Source": "https://github.com/mosquito/lxd-exporter/",
         "Tracker": "https://github.com/mosquito/lxd-exporter/issues",
         "Say Thanks!": "https://saythanks.io/to/me%40mosquito.su",
     },
-    packages=[],
+    packages=["."],
     classifiers=[
         "License :: OSI Approved :: Apache Software License",
         "Topic :: Software Development",
