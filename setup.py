@@ -3,7 +3,7 @@ from setuptools import setup
 
 setup(
     name="lxd-exporter",
-    version="0.0.1",
+    version="0.1.0",
     include_package_data=True,
     license="Apache Software License",
     author="Dmitry Orlov",
