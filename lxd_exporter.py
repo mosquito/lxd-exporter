@@ -13,6 +13,7 @@ import os
 from flask import Flask
 from pylxd import Client
 from pylxd.models import Container, StoragePool, StorageResources, Profile
+from pylxd.models.instance import InstanceState
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
 from prometheus_client import make_wsgi_app, Gauge, Counter as MetricCounter
 from gevent.pywsgi import WSGIServer
@@ -232,6 +233,128 @@ class LimitsCPUEffectiveCollector(ContainerVirtualCollector):
         ).set(value)
 
 
+class StateCollector(ContainerVirtualCollector):
+    METRIC_CPU = Gauge(
+        name="lxd_container_state_cpu",
+        documentation="Container CPU state",
+        labelnames=("container", "location")
+    )
+
+    METRIC_PROCESSES = Gauge(
+        name="lxd_container_state_processes",
+        documentation="Container running processes",
+        labelnames=("container", "location")
+    )
+
+    METRIC_DISK = Gauge(
+        name="lxd_container_state_disk_usage",
+        documentation="Container disk device statistic",
+        labelnames=("container", "location", "device")
+    )
+
+    METRIC_MEMORY = Gauge(
+        name="lxd_container_state_memory_usage",
+        documentation="Container memory usage",
+        labelnames=("container", "location")
+    )
+
+    METRIC_MEMORY_PEAK = Gauge(
+        name="lxd_container_state_memory_usage_peak",
+        documentation="Container memory peak usage",
+        labelnames=("container", "location")
+    )
+
+    METRIC_SWAP = Gauge(
+        name="lxd_container_state_swap_usage",
+        documentation="Container swap usage",
+        labelnames=("container", "location")
+    )
+
+    METRIC_SWAP_PEAK = Gauge(
+        name="lxd_container_state_swap_usage_peak",
+        documentation="Container swap peak usage",
+        labelnames=("container", "location")
+    )
+
+    METRIC_IF_STATE = Gauge(
+        name="lxd_container_state_network_interface",
+        documentation="Container interface state",
+        labelnames=("container", "location", "device", "state")
+    )
+
+    METRIC_IP = Gauge(
+        name="lxd_container_state_network_addresses",
+        documentation="Container IP addresses",
+        labelnames=("container", "location", "device", "family")
+    )
+
+    METRIC_NETWORK_RX = MetricCounter(
+        name="lxd_container_state_network_bytes_rx",
+        documentation="Container network received bytes",
+        labelnames=("container", "location", "device")
+    )
+
+    METRIC_NETWORK_TX = MetricCounter(
+        name="lxd_container_state_network_bytes_tx",
+        documentation="Container network transmitted bytes",
+        labelnames=("container", "location", "device")
+    )
+
+    METRIC_NETWORK_PACKETS_RX = MetricCounter(
+        name="lxd_container_state_network_packets_rx",
+        documentation="Container network received packets",
+        labelnames=("container", "location", "device")
+    )
+
+    METRIC_NETWORK_PACKETS_TX = MetricCounter(
+        name="lxd_container_state_network_packets_tx",
+        documentation="Container network transmitted bytes",
+        labelnames=("container", "location", "device")
+    )
+
+    def update(self, container: Container):
+        state: InstanceState = container.state()
+        labels = MappingProxyType(dict(container=container.name, location=container.location))
+
+        self.METRIC_CPU.labels(**labels).set(state.cpu['usage'])
+        self.METRIC_PROCESSES.labels(**labels).set(state.processes)
+
+        for name, usage in state.disk.items():
+            self.METRIC_DISK.labels(device=name, **labels).set(usage['usage'])
+
+        self.METRIC_MEMORY.labels(**labels).set(state.memory['usage'])
+        self.METRIC_MEMORY_PEAK.labels(**labels).set(state.memory['usage_peak'])
+
+        self.METRIC_SWAP.labels(**labels).set(state.memory['swap_usage'])
+        self.METRIC_SWAP_PEAK.labels(**labels).set(state.memory['swap_usage_peak'])
+
+        for name, usage in state.network.items():
+            self.METRIC_NETWORK_RX.labels(
+                device=name, **labels
+            ).inc(usage['counters']['bytes_received'])
+            self.METRIC_NETWORK_TX.labels(
+                device=name, **labels
+            ).inc(usage['counters']['bytes_sent'])
+            self.METRIC_NETWORK_PACKETS_RX.labels(
+                device=name, **labels
+            ).inc(usage['counters']['packets_received'])
+            self.METRIC_NETWORK_PACKETS_TX.labels(
+                device=name, **labels
+            ).inc(usage['counters']['packets_sent'])
+            self.METRIC_IF_STATE.labels(
+                device=name, state=usage['state'], **labels
+            ).set(1)
+
+            ip_state = Counter()
+            for address in usage['addresses']:
+                ip_state[address['family']] += 1
+
+            for family, value in ip_state.items():
+                self.METRIC_IP.labels(
+                    device=name, family=family, **labels
+                ).set(value)
+
+
 class ContainerDiskCollector(ContainerDeviceCollector):
     METRIC = Gauge(
         name="lxd_container_device_disk",
@@ -340,6 +463,7 @@ CONTAINER_METRICS_REGISTRY: Mapping[str, ContainerCollector] = MappingProxyType(
 
 CONTAINER_VIRTUAL_METRICS_REGISTRY: Iterable[ContainerVirtualCollector] = (
     LimitsCPUEffectiveCollector(),
+    StateCollector(),
 )
 
 
