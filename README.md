@@ -21,7 +21,7 @@ APP_LISTEN=0.0.0.0 APP_PORT=8080 /usr/local/bin/lxd-exporter
 
 ## Configuration
 
-| Environment Variable | Default | Descrition |
+| Environment Variable | Default | Description |
 | -- | -- | -- |
 | `COLLECTOR_UPDATE_PERIOD` | 5 | How often collector will gather information from LXD daemon |
 | `LXD_ENDPOINT_PASSWORD` | - | LXD daemon password, useful when access to LXD daemon via network |
