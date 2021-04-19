@@ -27,6 +27,14 @@ app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {
 
 
 UPDATE_PERIOD = int(os.getenv('COLLECTOR_UPDATE_PERIOD', '5'))
+INTERFACE_SKIPS = tuple(os.getenv('INTERFACE_SKIPS', '').split(","))
+
+
+def is_interface_skipped(name):
+    for skip in INTERFACE_SKIPS:
+        if name.startswith(skip):
+            return True
+    return False
 
 
 def make_client():
@@ -329,6 +337,9 @@ class StateCollector(ContainerVirtualCollector):
         self.METRIC_SWAP_PEAK.labels(**labels).set(state.memory['swap_usage_peak'])
 
         for name, usage in state.network.items():
+            if is_interface_skipped(name):
+                continue
+
             self.METRIC_NETWORK_RX.labels(
                 device=name, **labels
             ).set(usage['counters']['bytes_received'])
