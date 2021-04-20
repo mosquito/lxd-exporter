@@ -229,7 +229,7 @@ class LimitsCPUEffectiveCollector(ContainerVirtualCollector):
         value = int(cpus)
         if allowance is not None:
             allowed, period = map(self.dehumanize_time, allowance.split("/", 1))
-            value *= allowed / period
+            return allowed / period
 
         return value
 
