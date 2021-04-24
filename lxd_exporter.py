@@ -336,6 +336,9 @@ class StateCollector(ContainerVirtualCollector):
         self.METRIC_SWAP.labels(**labels).set(state.memory['swap_usage'])
         self.METRIC_SWAP_PEAK.labels(**labels).set(state.memory['swap_usage_peak'])
 
+        if not state.network:
+            return
+
         for name, usage in state.network.items():
             if is_interface_skipped(name):
                 continue
