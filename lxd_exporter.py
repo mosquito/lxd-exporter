@@ -257,7 +257,7 @@ class StateCollector(ContainerVirtualCollector):
     METRIC_DISK = Gauge(
         name="lxd_container_state_disk_usage",
         documentation="Container disk device statistic",
-        labelnames=("container", "location", "device")
+        labelnames=("container", "location", "device", "pool")
     )
 
     METRIC_MEMORY = Gauge(
@@ -322,13 +322,21 @@ class StateCollector(ContainerVirtualCollector):
 
     def update(self, container: Container):
         state: InstanceState = container.state()
+        disks = {
+            key: value for key, value in container.devices.items()
+            if value.get('type') == 'disk'
+        }
         labels = MappingProxyType(dict(container=container.name, location=container.location))
 
         self.METRIC_CPU.labels(**labels).set(state.cpu['usage'])
         self.METRIC_PROCESSES.labels(**labels).set(state.processes)
 
         for name, usage in state.disk.items():
-            self.METRIC_DISK.labels(device=name, **labels).set(usage['usage'])
+            pool = disks.get(name, {}).get("pool")
+
+            self.METRIC_DISK.labels(
+                device=name, pool=pool, **labels
+            ).set(usage['usage'])
 
         self.METRIC_MEMORY.labels(**labels).set(state.memory['usage'])
         self.METRIC_MEMORY_PEAK.labels(**labels).set(state.memory['usage_peak'])
