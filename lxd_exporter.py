@@ -5,7 +5,7 @@ import gevent
 from abc import ABC, abstractmethod
 from types import MappingProxyType
 import re
-from typing import Mapping, Iterable, Any, Optional
+from typing import Mapping, Iterable, Any, Union
 
 import logging
 import os
@@ -16,6 +16,7 @@ from pylxd.models import Container, StoragePool, StorageResources, Profile
 from pylxd.models.instance import InstanceState
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
 from prometheus_client import make_wsgi_app, Gauge, Counter as MetricCounter
+from prometheus_client.utils import INF
 from gevent.pywsgi import WSGIServer
 from gevent import sleep
 
@@ -26,19 +27,19 @@ app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {
 })
 
 CONTAINER_STATUSES = MappingProxyType({
-    "Started": 0,
-    "Stopped": 0,
-    "Running": 0,
-    "Cancelling": 0,
-    "Pending": 0,
-    "Starting": 0,
-    "Stopping": 0,
-    "Aborting": 0,
-    "Freezing": 0,
-    "Frozen": 0,
-    "Thawed": 0,
-    "Success": 0,
-    "Failure": 0,
+    "started": 0,
+    "stopped": 0,
+    "running": 0,
+    "cancelling": 0,
+    "pending": 0,
+    "starting": 0,
+    "stopping": 0,
+    "aborting": 0,
+    "freezing": 0,
+    "frozen": 0,
+    "thawed": 0,
+    "success": 0,
+    "failure": 0,
 })
 
 UPDATE_PERIOD = int(os.getenv('COLLECTOR_UPDATE_PERIOD', '5'))
@@ -234,12 +235,12 @@ class LimitsCPUEffectiveCollector(ContainerVirtualCollector):
         labelnames=("container", "location")
     )
 
-    def get_cpu_limit(self, container: Container) -> Optional[int]:
+    def get_cpu_limit(self, container: Container) -> Union[int, float]:
         cpus = container.expanded_config.get("limits.cpu")
         allowance = container.expanded_config.get("limits.cpu.allowance")
 
         if cpus is None:
-            return None
+            return INF
 
         value = int(cpus)
         if allowance is not None:
