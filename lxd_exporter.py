@@ -273,7 +273,7 @@ class StateCollector(ContainerVirtualCollector):
     METRIC_DISK = Gauge(
         name="lxd_container_state_disk_usage",
         documentation="Container disk device statistic",
-        labelnames=("container", "location", "device", "pool")
+        labelnames=("container", "location", "device", "pool", "path")
     )
 
     METRIC_MEMORY = Gauge(
@@ -349,9 +349,10 @@ class StateCollector(ContainerVirtualCollector):
 
         for name, usage in state.disk.items():
             pool = disks.get(name, {}).get("pool")
+            path = disks.get(name, {}).get("path")
 
             self.METRIC_DISK.labels(
-                device=name, pool=pool, **labels
+                device=name, pool=pool, path=path, **labels
             ).set(usage['usage'])
 
         self.METRIC_MEMORY.labels(**labels).set(state.memory['usage'])
