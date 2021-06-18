@@ -339,7 +339,7 @@ class StateCollector(ContainerVirtualCollector):
     def update(self, container: Container):
         state: InstanceState = container.state()
         disks = {
-            key: value for key, value in container.devices.items()
+            key: value for key, value in container.expanded_devices.items()
             if value.get('type') == 'disk'
         }
         labels = MappingProxyType(dict(container=container.name, location=container.location))
