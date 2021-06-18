@@ -25,6 +25,21 @@ app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {
     '/metrics': make_wsgi_app()
 })
 
+CONTAINER_STATUSES = MappingProxyType({
+    "Started": 0,
+    "Stopped": 0,
+    "Running": 0,
+    "Cancelling": 0,
+    "Pending": 0,
+    "Starting": 0,
+    "Stopping": 0,
+    "Aborting": 0,
+    "Freezing": 0,
+    "Frozen": 0,
+    "Thawed": 0,
+    "Success": 0,
+    "Failure": 0,
+})
 
 UPDATE_PERIOD = int(os.getenv('COLLECTOR_UPDATE_PERIOD', '5'))
 INTERFACE_SKIPS = tuple(os.getenv('INTERFACE_SKIPS', '').split(","))
@@ -504,7 +519,7 @@ PROFILES_REGISTRY: Iterable[ProfileCollector] = (
 
 
 def collect():
-    containers = Counter()
+    containers = Counter(CONTAINER_STATUSES)
 
     for container in CLIENT.containers.all():
         containers[container.status.lower()] += 1
