@@ -3,7 +3,7 @@ from setuptools import setup
 
 setup(
     name="lxd-exporter",
-    version="0.3.5",
+    version="0.3.6",
     include_package_data=True,
     license="Apache Software License",
     author="Dmitry Orlov",
@@ -37,6 +37,9 @@ setup(
         "Flask==1.1.2",
         "gevent==21.1.2",
         "gunicorn~=20.1.0",
+        "itsdangerous==1.1.0",
+        "Jinja2==2.11.3",
+        "MarkupSafe==1.1.1",
         "prometheus-client==0.10.0",
         "pylxd==2.3.0",
         "werkzeug==1.0.1",
