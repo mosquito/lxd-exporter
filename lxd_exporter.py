@@ -927,7 +927,7 @@ def main():
 
     logging.info(
         "Network interfaces starts with %r will be skipped",
-        list(arguments.collector.skip_interface)[]
+        list(arguments.collector.skip_interface)
     )
     StateCollector.SKIP_INTERFACES = arguments.collector.skip_interface
 
