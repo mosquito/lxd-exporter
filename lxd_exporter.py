@@ -7,7 +7,8 @@ from abc import ABC
 from collections import Counter, defaultdict
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, FrozenSet, Iterable, Mapping, NamedTuple, Union
+from typing import Any, Dict, FrozenSet, Iterable, Mapping, NamedTuple, Union, \
+    Optional
 
 import aiohttp
 import argclass
@@ -27,10 +28,12 @@ NaN = float("NaN")
 
 
 class LxdGroup(argclass.Group):
-    url: URL
-    server_cert: Path
-    client_cert: Path
-    client_key: Path
+    url: URL = argclass.Argument(
+        default="unix:///var/snap/lxd/common/lxd/unix.socket"
+    )
+    server_cert: Optional[Path]
+    client_cert: Optional[Path]
+    client_key: Optional[Path]
 
 
 class ListenGroup(argclass.Group):
@@ -807,7 +810,7 @@ class CollectorService(PeriodicService):
     client_key: Path
     skip_interfaces: FrozenSet[str]
 
-    _ssl_context: ssl.SSLContext
+    _ssl_context: Optional[ssl.SSLContext]
     _client: aiohttp.ClientSession
 
     async def do_request(self, path: str, method="GET", **kwargs) -> dict:
@@ -896,17 +899,41 @@ class CollectorService(PeriodicService):
                     )
 
     async def start(self):
-        await super().start()
-        self._ssl_context = ssl.SSLContext()
-        self._ssl_context.load_verify_locations(
-            str(self.lxd_cert.expanduser()),
-        )
-        self._ssl_context.load_cert_chain(
-            str(self.client_cert.expanduser()),
-            str(self.client_key.expanduser()),
+        if self.lxd_url.scheme == 'unix':
+            path = Path(self.lxd_url.path)
+
+            if not path.is_socket():
+                raise RuntimeError("Path %s is not a unix socket" % path)
+            connector = aiohttp.UnixConnector(path=str(path))
+            self._ssl_context = None
+            self.lxd_url = URL.build(
+                scheme="http",
+                host="lxd",
+                user=self.lxd_url.user or "",
+                password=self.lxd_url.password or "",
+                query_string=self.lxd_url.query_string or "",
+                authority=self.lxd_url.authority or "",
+                port=self.lxd_url.port,
+                path="/",
+            )
+        else:
+            connector = aiohttp.TCPConnector()
+            self._ssl_context = ssl.SSLContext()
+            self._ssl_context.load_verify_locations(
+                str(self.lxd_cert.expanduser()),
+            )
+            self._ssl_context.load_cert_chain(
+                str(self.client_cert.expanduser()),
+                str(self.client_key.expanduser()),
+            )
+
+        self._client = aiohttp.ClientSession(
+            connector=connector,
+            connector_owner=True,
+            raise_for_status=True
         )
 
-        self._client = aiohttp.ClientSession(raise_for_status=True)
+        await super().start()
 
 
 def main():
