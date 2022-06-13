@@ -51,7 +51,7 @@ class CollectorGroup(argclass.Group):
     delay: int = 0
     skip_interface: FrozenSet[str] = argclass.Argument(
         nargs=argclass.Nargs.ONE_OR_MORE, converter=frozenset,
-        default='["veth", "dummy", "tun", "tap", "erspan", "gre", "ip6tnl"]'
+        default="[]"
     )
 
 
@@ -562,7 +562,13 @@ class StateCollector(ContainerVirtualCollector):
             return
 
         for name, usage in state["network"].items():
-            if name in self.SKIP_INTERFACES:
+            skipping = False
+            for skip in self.SKIP_INTERFACES:
+                if name.startswith(skip):
+                    skipping = True
+                    break
+
+            if skipping:
                 continue
 
             self.METRIC_NETWORK_RX.labels(
@@ -919,6 +925,10 @@ def main():
         level=arguments.log.level,
     )
 
+    logging.info(
+        "Network interfaces starts with %r will be skipped",
+        list(arguments.collector.skip_interface)[]
+    )
     StateCollector.SKIP_INTERFACES = arguments.collector.skip_interface
 
     services = [
