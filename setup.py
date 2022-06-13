@@ -12,7 +12,7 @@ setup(
     project_urls={
         "Source": "https://github.com/mosquito/lxd-exporter/",
         "Tracker": "https://github.com/mosquito/lxd-exporter/issues",
-        "Say Thanks!": "https://saythanks.io/to/me%40mosquito.su",
+        "Say Thanks!": "https://saythanks.io/to/mosquito",
     },
     packages=["."],
     classifiers=[
@@ -34,15 +34,9 @@ setup(
     ],
     python_requires=">=3.8.*, <4",
     install_requires=[
-        "Flask==1.1.2",
-        "gevent==21.1.2",
-        "gunicorn~=20.1.0",
-        "itsdangerous==1.1.0",
-        "Jinja2==2.11.3",
-        "MarkupSafe==1.1.1",
-        "prometheus-client==0.10.0",
-        "pylxd==2.3.0",
-        "werkzeug==1.0.1",
+        "aiomisc~=16.0",
+        "aiohttp~=3.8",
+        "argclass~=0.8",
     ],
     entry_points={
         "console_scripts": ["lxd-exporter = lxd_exporter:main"]

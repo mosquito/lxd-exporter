@@ -1,30 +1,188 @@
-from collections import Counter
-
-import gevent
-
-from abc import ABC, abstractmethod
-from types import MappingProxyType
-import re
-from typing import Mapping, Iterable, Any, Union
-
 import logging
-import os
+import re
+import ssl
+import threading
+import time
+from abc import ABC
+from collections import Counter, defaultdict
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Dict, FrozenSet, Iterable, Mapping, NamedTuple, Union
 
-from flask import Flask
-from pylxd import Client
-from pylxd.models import Container, StoragePool, StorageResources, Profile
-from pylxd.models.instance import InstanceState
-from werkzeug.middleware.dispatcher import DispatcherMiddleware
-from prometheus_client import make_wsgi_app, Gauge, Counter as MetricCounter
-from prometheus_client.utils import INF
-from gevent.pywsgi import WSGIServer
-from gevent import sleep
+import aiohttp
+import argclass
+from aiohttp import web
+from aiomisc import entrypoint, threaded_iterable
+from aiomisc.service.aiohttp import AIOHTTPService
+from aiomisc.service.periodic import PeriodicService
+from aiomisc.service.sdwatchdog import SDWatchdogService
+from aiomisc_log import LogFormat, basic_config
+from yarl import URL
 
 
-app = Flask(__name__)
-app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {
-    '/metrics': make_wsgi_app()
-})
+ValueType = Union[int, float]
+INF = float("inf")
+MINUS_INF = float("-inf")
+NaN = float("NaN")
+
+
+class LxdGroup(argclass.Group):
+    url: URL
+    server_cert: Path
+    client_cert: Path
+    client_key: Path
+
+
+class ListenGroup(argclass.Group):
+    address: str
+    port: int
+
+
+class LogGroup(argclass.Group):
+    level: int = argclass.LogLevel
+    format: str = argclass.Argument(
+        default=LogFormat.default(),
+        choices=LogFormat.choices(),
+    )
+
+
+class PeriodicGroup(argclass.Group):
+    interval: int
+    delay: int = 0
+
+
+class CollectorGroup(PeriodicGroup):
+    skip_interface: FrozenSet[str] = argclass.Argument(
+        nargs=argclass.Nargs.ONE_OR_MORE, converter=frozenset,
+    )
+
+
+class Parser(argclass.Parser):
+    log = LogGroup(title="Logging options")
+    lxd = LxdGroup(title="LXD options")
+    http = ListenGroup(
+        title="HTTP server options",
+        defaults=dict(address="127.0.0.1", port=8080),
+    )
+    collector = PeriodicGroup(
+        title="Collector Service options",
+        defaults=dict(interval=30),
+    )
+    pool_size: int = 4
+
+
+class MetricBase:
+    __slots__ = ("name", "label_names", "type", "help")
+
+    def __init__(
+        self, *, name: str, labelnames: Iterable[str], help: str = None,
+        type: str = "gauge", namespace: str, subsystem: str, unit: str,
+    ):
+        self.name = "_".join(filter(None, (namespace, subsystem, name, unit)))
+        self.help = help
+        self.type = type
+        self.label_names = frozenset(labelnames)
+
+
+class Record(NamedTuple):
+    metric: MetricBase
+    labels: str
+
+    def set(self, value: ValueType) -> None:
+        STORAGE.add(self, float(value))
+
+
+class Metric(MetricBase):
+    def labels(self, **kwargs) -> Record:
+        labels = []
+        for lname in sorted(self.label_names):
+            lvalue = kwargs[lname]
+
+            if lvalue is None:
+                continue
+
+            lvalue = str(lvalue).replace('"', '\\"')
+            labels.append(f"{lname}=\"{lvalue}\"")
+
+        return Record(
+            metric=self, labels=",".join(labels),
+        )
+
+
+class Storage:
+    metrics: Dict[MetricBase, Dict[Record, ValueType]]
+    metrics_ttl: Dict[MetricBase, float]
+
+    def __init__(self, metric_ttl: int = 600):
+        self.metrics = defaultdict(dict)
+        self.lock = threading.Lock()
+        self.metric_ttl = metric_ttl
+        self.metrics_ttl = dict()
+
+    def add(self, record: Record, value: ValueType):
+        value = float(value)
+        metric = record.metric
+        self.metrics_ttl[metric] = time.monotonic()
+
+        if metric in self.metrics and record in self.metrics[metric]:
+            self.metrics[record.metric][record] = value
+            return
+
+        # prevent change when iterating
+        with self.lock:
+            self.metrics[metric][record] = value
+
+    def __iter__(self):
+        with self.lock:
+            ts = time.monotonic()
+            for metric, records in self.metrics.items():
+                ttl = self.metrics_ttl.get(metric)
+                if ttl and ttl + self.metric_ttl < ts:
+                    continue
+
+                if metric.help:
+                    yield f"# HELP {metric.name} {metric.help}\n"
+
+                if metric.type:
+                    yield f"# TYPE {metric.name} {metric.type}\n"
+
+                for record, value in records.items():
+                    yield "%s{%s} %.6e\n" % (
+                        metric.name, record.labels, value,
+                    )
+
+
+STORAGE = Storage()
+
+
+class MetricsAPI(AIOHTTPService):
+    compression: bool = False
+
+    @threaded_iterable
+    def provide_metrics(self):
+        for line in STORAGE:
+            yield line.encode()
+
+    async def metrics(self, request: web.Request):
+        response = web.StreamResponse()
+        response.content_type = "text/plain; version=0.0.4; charset=utf-8"
+        response.enable_chunked_encoding()
+
+        if self.compression:
+            response.enable_compression()
+
+        await response.prepare(request)
+
+        async for line in self.provide_metrics():
+            await response.write(line)
+        await response.write_eof()
+        return response
+
+    async def create_application(self) -> web.Application:
+        app = web.Application()
+        app.router.add_get("/metrics", self.metrics)
+        return app
+
 
 CONTAINER_STATUSES = MappingProxyType({
     "started": 0,
@@ -41,37 +199,6 @@ CONTAINER_STATUSES = MappingProxyType({
     "success": 0,
     "failure": 0,
 })
-
-UPDATE_PERIOD = int(os.getenv('COLLECTOR_UPDATE_PERIOD', '5'))
-INTERFACE_SKIPS = tuple(os.getenv('INTERFACE_SKIPS', '').split(","))
-
-
-def is_interface_skipped(name):
-    for skip in INTERFACE_SKIPS:
-        if name.startswith(skip):
-            return True
-    return False
-
-
-def make_client():
-    lxd_password = os.getenv("LXD_ENDPOINT_PASSWORD")
-
-    lxd_cert = os.getenv("LXD_ENDPOINT_CERT")
-    lxd_key = os.getenv("LXD_ENDPOINT_KEY")
-
-    client = Client(
-        endpoint=os.getenv("LXD_ENDPOINT"),
-        verify=bool(int(os.getenv("LXD_ENDPOINT_VERIFY_SSL", '1'))),
-        cert=(lxd_cert, lxd_key) if lxd_key is not None else None
-    )
-
-    if lxd_password:
-        client.authenticate(lxd_password)
-
-    return client
-
-
-CLIENT = make_client()
 
 
 class CollectorBase(ABC):
@@ -90,303 +217,371 @@ class CollectorBase(ABC):
             "s": 1.0,
             "ms": 0.001,
             "us": 0.000001,
-            "ns": 0.000000001
+            "ns": 0.000000001,
         }
         value, suffix = re.match(r"^([\d.]+)(\w+)?$", human_value).groups()
         return float(value) * suffixes[suffix]
 
-    @abstractmethod
     def update(self, *args):
         pass
 
 
 class ContainerCollector(CollectorBase):
-    @abstractmethod
-    def update(self, container: Container, value: str):
-        pass
+    pass
 
 
 class ContainerVirtualCollector(CollectorBase):
-    @abstractmethod
-    def update(self, container: Container):
-        pass
+    pass
 
 
 class ContainerDeviceCollector(CollectorBase):
-    @abstractmethod
-    def update(self, container: Container, device_name: str, device: Mapping[str, Any]):
-        pass
+    pass
 
 
 class StorageCollector(CollectorBase):
-    @abstractmethod
-    def update(self, storage: StoragePool):
-        pass
+    pass
 
 
 class ProfileCollector(CollectorBase):
-    @abstractmethod
-    def update(self, profile: Profile):
-        pass
+    pass
 
 
-def simple_collector(name, documentation, labels=("container", "location")):
+def simple_collector(name, unit, help, labels=("container", "location")):
     class SimpleCollector(ContainerCollector):
-        METRIC = Gauge(
+        METRIC = Metric(
+            namespace="lxd",
+            subsystem="container",
             name=name,
-            documentation=documentation,
-            labelnames=labels
+            unit=unit,
+            help=help,
+            labelnames=labels,
         )
 
-        def update(self, container: Container, value: str):
+        def update(self, container: dict, value: str):
             self.METRIC.labels(
-                container=container.name, location=container.location
+                container=container["name"],
+                location=container["location"],
             ).set(int(value))
 
     return SimpleCollector
 
 
 BootPriorityCollector = simple_collector(
-    name='lxd_container_boot_autostart_priority',
-    documentation='Container boot autostart priority'
+    name="boot",
+    unit="autostart_priority",
+    help="Container boot autostart priority",
 )
 
 
 class ImageOSCollector(ContainerCollector):
-    METRIC = Gauge(
-        name="lxd_container_image_os",
-        documentation="Container os name image string",
-        labelnames=("container", "location", "os")
+    METRIC = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="image",
+        unit="os",
+        help="Container os name image string",
+        labelnames=("container", "location", "os"),
     )
 
-    def update(self, container: Container, value: str):
+    def update(self, container: dict, value: str):
         self.METRIC.labels(
-            container=container.name, location=container.location, os=value
+            container=container["name"],
+            location=container["location"],
+            os=value,
         ).set(1)
 
 
 class ImageOSReleaseCollector(ContainerCollector):
-    METRIC = Gauge(
-        name="lxd_container_image_os_release",
-        documentation="Container os release image string",
-        labelnames=("container", "location", "release")
+    METRIC = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="image",
+        unit="os_release",
+        help="Container os release image string",
+        labelnames=("container", "location", "release"),
     )
 
-    def update(self, container: Container, value: str):
+    def update(self, container: dict, value: str):
         self.METRIC.labels(
-            container=container.name, location=container.location, release=value
+            container=container["name"],
+            location=container["location"],
+            release=value,
         ).set(1)
 
 
 class ImageOSVersionCollector(ContainerCollector):
-    METRIC = Gauge(
-        name="lxd_container_image_os_version",
-        documentation="Container os version image string",
-        labelnames=("container", "location", "version")
+    METRIC = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="image",
+        unit="os_version",
+        help="Container os version image string",
+        labelnames=("container", "location", "version"),
     )
 
-    def update(self, container: Container, value: str):
+    def update(self, container: dict, value: str):
         self.METRIC.labels(
-            container=container.name, location=container.location, version=value
+            container=container["name"],
+            location=container["location"],
+            version=value,
         ).set(1)
 
 
 class ImageOSSerialCollector(ContainerCollector):
-    METRIC = Gauge(
-        name="lxd_container_image_os_serial",
-        documentation="Container os serial image string",
-        labelnames=("container", "location", "serial")
+    METRIC = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="image",
+        unit="os_serial",
+        help="Container os serial image string",
+        labelnames=("container", "location", "serial"),
     )
 
-    def update(self, container: Container, value: str):
+    def update(self, container: dict, value: str):
         self.METRIC.labels(
-            container=container.name, location=container.location, serial=value
+            container=container["name"],
+            location=container["location"],
+            serial=value,
         ).set(1)
 
 
 LimitsCPUCollector = simple_collector(
-    name="lxd_container_limits_cpu",
-    documentation="Container cpu limit"
+    name="limits", unit="cpu",
+    help="Container cpu limit",
 )
 
 LimitsProcessesCollector = simple_collector(
-    name="lxd_container_limits_processes",
-    documentation="Container processes limit",
+    name="limits", unit="processes",
+    help="Container processes limit",
 )
 
 
 class LimitsMemoryCollector(ContainerCollector):
-    METRIC = Gauge(
-        name="lxd_container_limits_memory",
-        documentation="Container limits memory",
-        labelnames=("container", "location")
+    METRIC = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="limits",
+        unit="memory",
+        help="Container limits memory",
+        labelnames=("container", "location"),
     )
 
-    def update(self, container: Container, value: str):
+    def update(self, container: dict, value: str):
         self.METRIC.labels(
-            container=container.name, location=container.location
+            container=container["name"], location=container["location"],
         ).set(self.dehumanize_size(value))
 
 
 class LimitsCPUEffectiveCollector(ContainerVirtualCollector):
-    METRIC = Gauge(
-        name="lxd_container_limits_cpu_effective",
-        documentation="Container effective cpu limit",
-        labelnames=("container", "location")
+    METRIC = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="limits",
+        unit="cpu_effective",
+        help="Container effective cpu limit",
+        labelnames=("container", "location"),
     )
 
-    def get_cpu_limit(self, container: Container) -> Union[int, float]:
-        cpus = container.expanded_config.get("limits.cpu")
-        allowance = container.expanded_config.get("limits.cpu.allowance")
+    def get_cpu_limit(self, container: dict) -> Union[int, float]:
+        cpus = container["expanded_config"].get("limits.cpu")
+        allowance = container["expanded_config"].get("limits.cpu.allowance")
 
         if cpus is None:
             return INF
 
         value = int(cpus)
         if allowance is not None:
-            allowed, period = map(self.dehumanize_time, allowance.split("/", 1))
+            allowed, period = map(
+                self.dehumanize_time, allowance.split("/", 1),
+            )
             return allowed / period
 
         return value
 
-    def update(self, container: Container):
+    def update(self, container: dict):
         value = self.get_cpu_limit(container)
 
         self.METRIC.labels(
-            container=container.name, location=container.location
+            container=container["name"], location=container["location"],
         ).set(value)
 
 
 class StateCollector(ContainerVirtualCollector):
-    METRIC_CPU = Gauge(
-        name="lxd_container_state_cpu",
-        documentation="Container CPU state",
-        labelnames=("container", "location")
+    METRIC_CPU = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="cpu",
+        help="Container CPU state",
+        labelnames=("container", "location"),
     )
 
-    METRIC_PROCESSES = Gauge(
-        name="lxd_container_state_processes",
-        documentation="Container running processes",
-        labelnames=("container", "location")
+    METRIC_PROCESSES = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="processes",
+        help="Container running processes",
+        labelnames=("container", "location"),
     )
 
-    METRIC_DISK = Gauge(
-        name="lxd_container_state_disk_usage",
-        documentation="Container disk device statistic",
-        labelnames=("container", "location", "device", "pool", "path")
+    METRIC_DISK = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="disk_usage",
+        help="Container disk device statistic",
+        labelnames=("container", "location", "device", "pool", "path"),
     )
 
-    METRIC_MEMORY = Gauge(
-        name="lxd_container_state_memory_usage",
-        documentation="Container memory usage",
-        labelnames=("container", "location")
+    METRIC_MEMORY = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="memory_usage",
+        help="Container memory usage",
+        labelnames=("container", "location"),
     )
 
-    METRIC_MEMORY_PEAK = Gauge(
-        name="lxd_container_state_memory_usage_peak",
-        documentation="Container memory peak usage",
-        labelnames=("container", "location")
+    METRIC_MEMORY_PEAK = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="memory_usage_peak",
+        help="Container memory peak usage",
+        labelnames=("container", "location"),
     )
 
-    METRIC_SWAP = Gauge(
-        name="lxd_container_state_swap_usage",
-        documentation="Container swap usage",
-        labelnames=("container", "location")
+    METRIC_SWAP = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="swap_usage",
+        help="Container swap usage",
+        labelnames=("container", "location"),
     )
 
-    METRIC_SWAP_PEAK = Gauge(
-        name="lxd_container_state_swap_usage_peak",
-        documentation="Container swap peak usage",
-        labelnames=("container", "location")
+    METRIC_SWAP_PEAK = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="swap_usage_peak",
+        help="Container swap peak usage",
+        labelnames=("container", "location"),
     )
 
-    METRIC_IF_STATE = Gauge(
-        name="lxd_container_state_network_interface",
-        documentation="Container interface state",
-        labelnames=("container", "location", "device", "state")
+    METRIC_IF_STATE = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="network_interface",
+        help="Container interface state",
+        labelnames=("container", "location", "device", "state"),
     )
 
-    METRIC_IP = Gauge(
-        name="lxd_container_state_network_addresses",
-        documentation="Container IP addresses",
-        labelnames=("container", "location", "device", "family")
+    METRIC_IP = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="network_addresses",
+        help="Container IP addresses",
+        labelnames=("container", "location", "device", "family"),
     )
 
-    METRIC_NETWORK_RX = Gauge(
-        name="lxd_container_state_network_bytes_rx",
-        documentation="Container network received bytes",
-        labelnames=("container", "location", "device")
+    METRIC_NETWORK_RX = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="network_bytes_rx",
+        help="Container network received bytes",
+        labelnames=("container", "location", "device"),
     )
 
-    METRIC_NETWORK_TX = Gauge(
-        name="lxd_container_state_network_bytes_tx",
-        documentation="Container network transmitted bytes",
-        labelnames=("container", "location", "device")
+    METRIC_NETWORK_TX = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="network_bytes_tx",
+        help="Container network transmitted bytes",
+        labelnames=("container", "location", "device"),
     )
 
-    METRIC_NETWORK_PACKETS_RX = Gauge(
-        name="lxd_container_state_network_packets_rx",
-        documentation="Container network received packets",
-        labelnames=("container", "location", "device")
+    METRIC_NETWORK_PACKETS_RX = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="network_packets_rx",
+        help="Container network received packets",
+        labelnames=("container", "location", "device"),
     )
 
-    METRIC_NETWORK_PACKETS_TX = Gauge(
-        name="lxd_container_state_network_packets_tx",
-        documentation="Container network transmitted bytes",
-        labelnames=("container", "location", "device")
+    METRIC_NETWORK_PACKETS_TX = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="state",
+        unit="network_packets_tx",
+        help="Container network transmitted bytes",
+        labelnames=("container", "location", "device"),
     )
 
-    def update(self, container: Container):
-        state: InstanceState = container.state()
+    def update(self, container: dict):
+        state: dict = container["state"]
         disks = {
-            key: value for key, value in container.expanded_devices.items()
-            if value.get('type') == 'disk'
+            key: value for key, value in container["expanded_devices"].items()
+            if value.get("type") == "disk"
         }
-        labels = MappingProxyType(dict(container=container.name, location=container.location))
+        labels = MappingProxyType(
+            dict(container=container["name"], location=container["location"]),
+        )
 
-        self.METRIC_CPU.labels(**labels).set(state.cpu['usage'])
-        self.METRIC_PROCESSES.labels(**labels).set(state.processes)
+        self.METRIC_CPU.labels(**labels).set(state["cpu"]["usage"])
+        self.METRIC_PROCESSES.labels(**labels).set(state["processes"])
 
-        for name, usage in state.disk.items():
+        for name, usage in state["disk"].items():
             pool = disks.get(name, {}).get("pool")
             path = disks.get(name, {}).get("path")
 
             self.METRIC_DISK.labels(
                 device=name, pool=pool, path=path, **labels
-            ).set(usage['usage'])
+            ).set(usage["usage"])
 
-        self.METRIC_MEMORY.labels(**labels).set(state.memory['usage'])
-        self.METRIC_MEMORY_PEAK.labels(**labels).set(state.memory['usage_peak'])
+        self.METRIC_MEMORY.labels(**labels).set(
+            state["memory"]["usage"],
+        )
+        self.METRIC_MEMORY_PEAK.labels(**labels).set(
+            state["memory"]["usage_peak"],
+        )
 
-        self.METRIC_SWAP.labels(**labels).set(state.memory['swap_usage'])
-        self.METRIC_SWAP_PEAK.labels(**labels).set(state.memory['swap_usage_peak'])
+        self.METRIC_SWAP.labels(**labels).set(
+            state["memory"]["swap_usage"],
+        )
+        self.METRIC_SWAP_PEAK.labels(**labels).set(
+            state["memory"]["swap_usage_peak"],
+        )
 
-        if not state.network:
+        if not state["network"]:
             return
 
-        for name, usage in state.network.items():
-            if is_interface_skipped(name):
-                continue
-
+        for name, usage in state["network"].items():
             self.METRIC_NETWORK_RX.labels(
                 device=name, **labels
-            ).set(usage['counters']['bytes_received'])
+            ).set(usage["counters"]["bytes_received"])
             self.METRIC_NETWORK_TX.labels(
                 device=name, **labels
-            ).set(usage['counters']['bytes_sent'])
+            ).set(usage["counters"]["bytes_sent"])
             self.METRIC_NETWORK_PACKETS_RX.labels(
                 device=name, **labels
-            ).set(usage['counters']['packets_received'])
+            ).set(usage["counters"]["packets_received"])
             self.METRIC_NETWORK_PACKETS_TX.labels(
                 device=name, **labels
-            ).set(usage['counters']['packets_sent'])
+            ).set(usage["counters"]["packets_sent"])
             self.METRIC_IF_STATE.labels(
-                device=name, state=usage['state'], **labels
+                device=name, state=usage["state"], **labels
             ).set(1)
 
             ip_state = Counter()
-            for address in usage['addresses']:
-                ip_state[address['family']] += 1
+            for address in usage["addresses"]:
+                ip_state[address["family"]] += 1
 
             for family, value in ip_state.items():
                 self.METRIC_IP.labels(
@@ -395,38 +590,63 @@ class StateCollector(ContainerVirtualCollector):
 
 
 class ContainerDiskCollector(ContainerDeviceCollector):
-    METRIC = Gauge(
-        name="lxd_container_device_disk",
-        documentation="Container disk device statistic",
-        labelnames=("container", "location", "device", "pool", "path")
+    METRIC = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="device",
+        unit="disk",
+        help="Container disk device statistic",
+        labelnames=("container", "location", "device", "pool", "path"),
     )
 
-    METRIC_SIZE = Gauge(
-        name="lxd_container_device_disk_size",
-        documentation="Container disk size device statistic",
-        labelnames=("container", "location", "device", "pool", "path")
+    METRIC_SIZE = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="device",
+        unit="disk_size",
+        help="Container disk size device statistic",
+        labelnames=("container", "location", "device", "pool", "path"),
     )
 
-    METRIC_LIMITS = Gauge(
-        name="lxd_container_device_disk_limits",
-        documentation="Container disk size device statistic",
-        labelnames=("container", "location", "device", "pool", "path", "read", "write")
+    METRIC_LIMITS = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="device",
+        unit="disk_limits",
+        help="Container disk size device statistic",
+        labelnames=(
+            "container", "location", "device", "pool", "path", "read", "write",
+        ),
     )
 
-    METRIC_LIMITS_IOPS = Gauge(
-        name="lxd_container_device_disk_limits_iops",
-        documentation="Container disk size device statistic",
-        labelnames=("container", "location", "device", "pool", "path", "read", "write")
+    METRIC_LIMITS_IOPS = Metric(
+        namespace="lxd",
+        subsystem="container",
+        name="device",
+        unit="disk_limits_iops",
+        help="Container disk size device statistic",
+        labelnames=(
+            "container", "location", "device", "pool", "path", "read", "write",
+        ),
     )
 
-    def update(self, container: Container, device_name: str, device: Mapping[str, Any]):
-        labels = dict(container=container.name, location=container.location, device=device_name,
-                      pool=device.get('pool'), path=device.get('path'))
+    def update(
+        self, container: dict, device_name: str, device: Mapping[str, Any],
+    ):
+        labels = dict(
+            container=container["name"],
+            location=container["location"],
+            device=device_name,
+            pool=device.get("pool"),
+            path=device.get("path"),
+        )
 
         self.METRIC.labels(**labels).set(1)
 
-        if 'size' in device:
-            self.METRIC_SIZE.labels(**labels).set(self.dehumanize_size(device['size']))
+        if "size" in device:
+            self.METRIC_SIZE.labels(**labels).set(
+                self.dehumanize_size(device["size"]),
+            )
 
         def update_limit(value, **kwargs):
             limits_lables = dict(labels)
@@ -442,62 +662,108 @@ class ContainerDiskCollector(ContainerDeviceCollector):
             metric.labels(**limits_lables).set(value)
 
         if device.keys() & {"limits.max", "limits.read", "limits.write"}:
-            if 'limits.max' in device:
-                update_limit(device['limits.max'], read=1, write=1)
-            if 'limits.read' in device:
-                update_limit(device['limits.read'], read=1, write=0)
-            if 'limits.write' in device:
-                update_limit(device['limits.write'], read=0, write=1)
+            if "limits.max" in device:
+                update_limit(device["limits.max"], read=1, write=1)
+            if "limits.read" in device:
+                update_limit(device["limits.read"], read=1, write=0)
+            if "limits.write" in device:
+                update_limit(device["limits.write"], read=0, write=1)
 
 
 class StorageResourceCollector(StorageCollector):
-    METRIC_TOTAL = Gauge(
-        name="lxd_storage_space_total",
-        documentation="Storage pool total space",
-        labelnames=("pool",)
+    SPACE_TOTAL = Metric(
+        namespace="lxd",
+        subsystem="storage",
+        name="space",
+        unit="total",
+        help="Storage pool total space",
+        labelnames=("pool",),
     )
 
-    METRIC_USED = Gauge(
-        name="lxd_storage_space_used",
-        documentation="Storage pool used space",
-        labelnames=("pool",)
+    SPACE_USED = Metric(
+        namespace="lxd",
+        subsystem="storage",
+        name="space",
+        unit="used",
+        help="Storage pool used space",
+        labelnames=("pool",),
     )
 
-    def update(self, storage: StoragePool):
-        resources: StorageResources = storage.resources.get()
+    INODES_TOTAL = Metric(
+        namespace="lxd",
+        subsystem="storage",
+        name="inodes",
+        unit="total",
+        help="Storage pool total space",
+        labelnames=("pool",),
+    )
 
-        self.METRIC_TOTAL.labels(pool=storage.name).set(resources.space['total'])
-        self.METRIC_USED.labels(pool=storage.name).set(resources.space['used'])
+    INODES_USED = Metric(
+        namespace="lxd",
+        subsystem="storage",
+        name="inodes",
+        unit="used",
+        help="Storage pool used space",
+        labelnames=("pool",),
+    )
+
+    def update(self, storage: dict):
+        resources: dict = storage["resources"]
+
+        self.SPACE_TOTAL.labels(pool=storage["name"]).set(
+            resources["space"]["total"],
+        )
+        self.SPACE_USED.labels(pool=storage["name"]).set(
+            resources["space"]["used"],
+        )
+        self.INODES_TOTAL.labels(pool=storage["name"]).set(
+            resources["inodes"]["total"],
+        )
+        self.INODES_USED.labels(pool=storage["name"]).set(
+            resources["inodes"]["used"],
+        )
 
 
 class ProfileUsageCollector(ProfileCollector):
-    METRIC_PROFILE = Gauge(
-        name="lxd_profile_usage_count",
-        documentation="Profile metrics",
-        labelnames=('profile',)
+    METRIC_PROFILE = Metric(
+        namespace="lxd",
+        subsystem="profile",
+        name="usage",
+        unit="count",
+        help="Profile metrics",
+        labelnames=("profile",),
     )
 
-    def update(self, profile: Profile):
-        self.METRIC_PROFILE.labels(profile=profile.name).set(len(profile.used_by))
+    def update(self, profile: dict):
+        self.METRIC_PROFILE.labels(
+            profile=profile["name"],
+        ).set(
+            len(profile["used_by"]),
+        )
 
 
-ContainersTotal = Gauge(
-    "lxd_container_count", "Total container count", labelnames=("status",)
+ContainersTotal = Metric(
+    namespace="lxd",
+    subsystem="container",
+    name="count",
+    unit="",
+    help="Total container count",
+    labelnames=("status",),
 )
 
-UpdateTime = MetricCounter("lxd_exporter_heartbeat", documentation="Last update since exporter start")
 
-
-CONTAINER_METRICS_REGISTRY: Mapping[str, ContainerCollector] = MappingProxyType({
-    "boot.autostart.priority": BootPriorityCollector(),
-    "image.os": ImageOSCollector(),
-    "image.release": ImageOSReleaseCollector(),
-    "image.version": ImageOSVersionCollector(),
-    "image.serial": ImageOSSerialCollector(),
-    "limits.cpu": LimitsCPUCollector(),
-    "limits.processes": LimitsProcessesCollector(),
-    "limits.memory": LimitsMemoryCollector()
-})
+CONTAINER_METRICS_REGISTRY: Mapping[str, ContainerCollector] = (
+    MappingProxyType({
+        "boot.autostart.priority": BootPriorityCollector(),
+        "image.os": ImageOSCollector(),
+        "image.release": ImageOSReleaseCollector(),
+        "image.version": ImageOSVersionCollector(),
+        "image.serial": ImageOSSerialCollector(),
+        "limits.cpu": LimitsCPUCollector(),
+        "limits.processes": LimitsProcessesCollector(),
+        "limits.memory": LimitsMemoryCollector(),
+    })
+)
 
 
 CONTAINER_VIRTUAL_METRICS_REGISTRY: Iterable[ContainerVirtualCollector] = (
@@ -506,9 +772,11 @@ CONTAINER_VIRTUAL_METRICS_REGISTRY: Iterable[ContainerVirtualCollector] = (
 )
 
 
-CONTAINER_DEVICE_REGISTRY: Mapping[str, Iterable[ContainerDeviceCollector]] = MappingProxyType({
-    "disk": (ContainerDiskCollector(), )
-})
+CONTAINER_DEVICE_REGISTRY: Mapping[str, Iterable[ContainerDeviceCollector]] = (
+    MappingProxyType({
+        "disk": (ContainerDiskCollector(),),
+    })
+)
 
 STORAGE_REGISTRY: Iterable[StorageCollector] = (
     StorageResourceCollector(),
@@ -520,84 +788,158 @@ PROFILES_REGISTRY: Iterable[ProfileCollector] = (
 )
 
 
-def collect():
-    containers = Counter(CONTAINER_STATUSES)
+class CollectorService(PeriodicService):
+    __required__ = (
+        "lxd_url", "lxd_cert", "client_cert", "client_key",
+    ) + tuple(PeriodicService.__required__)
 
-    for container in CLIENT.containers.all():
-        containers[container.status.lower()] += 1
+    lxd_url: URL
+    lxd_cert: Path
+    client_cert: Path
+    client_key: Path
 
-        for key, value in container.expanded_config.items():
-            if key not in CONTAINER_METRICS_REGISTRY:
-                logging.debug('Unhandled metric: %s = %r', key, value)
-                continue
+    _ssl_context: ssl.SSLContext
+    _client: aiohttp.ClientSession
 
-            collector_instance: ContainerCollector = CONTAINER_METRICS_REGISTRY[key]
-            try:
-                collector_instance.update(container, value)
-            except Exception:
-                logging.exception("Failed to colelct metric %r", key)
+    async def do_request(self, path: str, method="GET", **kwargs) -> dict:
+        async with self._client.request(
+            method=method,
+            url=str(self.lxd_url).rstrip("/") + path,
+            ssl_context=self._ssl_context,
+            **kwargs
+        ) as response:
+            return await response.json()
 
-        for collector_virtual in CONTAINER_VIRTUAL_METRICS_REGISTRY:
-            try:
-                collector_virtual.update(container)
-            except Exception:
-                logging.exception("Failed to update virtual metric collector %r", collector_virtual)
+    async def callback(self) -> Any:
+        container_states = Counter(CONTAINER_STATUSES)
 
-        for name, device in container.expanded_devices.items():
-            device_type = device.get('type')
-            for device_collector in CONTAINER_DEVICE_REGISTRY.get(device_type, []):
+        instances = await self.do_request("/1.0/instances?recursion=2")
+
+        container: dict
+        for container in instances["metadata"]:
+            container_states[container["status"].lower()] += 1
+
+            for key, value in container["expanded_config"].items():
+                if key not in CONTAINER_METRICS_REGISTRY:
+                    continue
+
+                collector_instance: ContainerCollector = (
+                    CONTAINER_METRICS_REGISTRY[key]
+                )
                 try:
-                    device_collector.update(container, name, device)
+                    collector_instance.update(container, value)
                 except Exception:
-                    logging.exception("Failed to collect device %r with collector %r", name, device_collector)
+                    logging.exception("Failed to colelct metric %r", key)
 
-    for status, value in containers.items():
-        ContainersTotal.labels(status=status).set(value)
+            for collector_virtual in CONTAINER_VIRTUAL_METRICS_REGISTRY:
+                try:
+                    collector_virtual.update(container)
+                except Exception:
+                    logging.exception(
+                        "Failed to update virtual metric collector %r",
+                        collector_virtual,
+                    )
 
-    for storage in CLIENT.storage_pools.all():
-        for storage_collector in STORAGE_REGISTRY:
-            try:
-                storage_collector.update(storage)
-            except Exception:
-                logging.exception("Failed to collect device %r with collector %r", name, device_collector)
+            for name, device in container["expanded_devices"].items():
+                device_type = device.get("type")
+                for device_collector in CONTAINER_DEVICE_REGISTRY.get(
+                    device_type, [],
+                ):
+                    try:
+                        device_collector.update(container, name, device)
+                    except Exception:
+                        logging.exception(
+                            "Failed to collect device %r with collector %r",
+                            name, device_collector,
+                        )
 
-    for profile in CLIENT.profiles.all():
-        for profile_collector in PROFILES_REGISTRY:
-            try:
-                profile_collector.update(profile)
-            except Exception:
-                logging.exception("Failed to collect profile %r with collector %r", profile.name, profile_collector)
+        for status, value in container_states.items():
+            ContainersTotal.labels(status=status).set(value)
 
-    UpdateTime.inc(1)
+        storages = await self.do_request("/1.0/storage-pools?recursion=1")
 
+        for storage in storages["metadata"]:
 
-def collector():
-    while True:
-        try:
-            collect()
-        except Exception:
-            logging.exception("Error when collecting")
-        finally:
-            sleep(UPDATE_PERIOD)
+            resources = await self.do_request(
+                f"/1.0/storage-pools/{storage['name']}/resources",
+            )
+            storage["resources"] = resources["metadata"]
 
+            for storage_collector in STORAGE_REGISTRY:
+                try:
+                    storage_collector.update(storage)
+                except Exception:
+                    logging.exception(
+                        "Failed to collect storage %r with collector %r",
+                        storage, storage_collector,
+                    )
 
-collector_greenlet = gevent.greenlet.Greenlet(collector)
-collector_greenlet.start()
+        profiles = await self.do_request("/1.0/profiles?recursion=1")
+
+        for profile in profiles["metadata"]:
+            for profile_collector in PROFILES_REGISTRY:
+                try:
+                    profile_collector.update(profile)
+                except Exception:
+                    logging.exception(
+                        "Failed to collect profile %r with collector %r",
+                        profile.name, profile_collector,
+                    )
+
+    async def start(self):
+        await super().start()
+        self._ssl_context = ssl.SSLContext()
+        self._ssl_context.load_verify_locations(
+            str(self.lxd_cert.expanduser()),
+        )
+        self._ssl_context.load_cert_chain(
+            str(self.client_cert.expanduser()),
+            str(self.client_key.expanduser()),
+        )
+
+        self._client = aiohttp.ClientSession(raise_for_status=True)
 
 
 def main():
-    logging.basicConfig(
-        level=getattr(
-            logging, os.getenv("LOG_LEVEL", "INFO").upper(),
-            logging.INFO
-        )
+    arguments = Parser(
+        auto_env_var_prefix="LXD_EXPORTER_",
+        config_files=[
+            "~/.config/lxd-exporter.ini",
+            "/etc/lxd-exporter.ini",
+        ],
     )
-    address = os.getenv("APP_LISTEN", "::1")
-    port = int(os.getenv('APP_PORT', '8080'))
-    http_server = WSGIServer((address, port), app)
-    logging.info("Listening %s:%d", address, port)
-    http_server.serve_forever()
+    arguments.parse_args()
+    arguments.sanitize_env()
+
+    basic_config(
+        log_format=arguments.log.format,
+        level=arguments.log.level,
+    )
+
+    services = [
+        MetricsAPI(
+            address=arguments.http.address,
+            port=arguments.http.port,
+        ),
+        CollectorService(
+            interval=arguments.collector.interval,
+            delay=arguments.collector.delay,
+            lxd_url=arguments.lxd.url,
+            lxd_cert=arguments.lxd.server_cert,
+            client_cert=arguments.lxd.client_cert,
+            client_key=arguments.lxd.client_key,
+        ),
+        SDWatchdogService(),
+    ]
+
+    with entrypoint(
+        *services,
+        log_format=arguments.log.format,
+        log_level=arguments.log.level,
+        pool_size=arguments.pool_size,
+    ) as loop:
+        loop.run_forever()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
