@@ -46,14 +46,12 @@ class LogGroup(argclass.Group):
     )
 
 
-class PeriodicGroup(argclass.Group):
+class CollectorGroup(argclass.Group):
     interval: int
     delay: int = 0
-
-
-class CollectorGroup(PeriodicGroup):
     skip_interface: FrozenSet[str] = argclass.Argument(
         nargs=argclass.Nargs.ONE_OR_MORE, converter=frozenset,
+        default='["veth", "dummy", "tun", "tap", "erspan", "gre", "ip6tnl"]'
     )
 
 
@@ -64,7 +62,7 @@ class Parser(argclass.Parser):
         title="HTTP server options",
         defaults=dict(address="127.0.0.1", port=8080),
     )
-    collector = PeriodicGroup(
+    collector = CollectorGroup(
         title="Collector Service options",
         defaults=dict(interval=30),
     )
@@ -407,6 +405,7 @@ class LimitsCPUEffectiveCollector(ContainerVirtualCollector):
 
 
 class StateCollector(ContainerVirtualCollector):
+    SKIP_INTERFACES: FrozenSet[str] = frozenset([])
     METRIC_CPU = Metric(
         namespace="lxd",
         subsystem="container",
@@ -563,6 +562,9 @@ class StateCollector(ContainerVirtualCollector):
             return
 
         for name, usage in state["network"].items():
+            if name in self.SKIP_INTERFACES:
+                continue
+
             self.METRIC_NETWORK_RX.labels(
                 device=name, **labels
             ).set(usage["counters"]["bytes_received"])
@@ -797,6 +799,7 @@ class CollectorService(PeriodicService):
     lxd_cert: Path
     client_cert: Path
     client_key: Path
+    skip_interfaces: FrozenSet[str]
 
     _ssl_context: ssl.SSLContext
     _client: aiohttp.ClientSession
@@ -915,6 +918,8 @@ def main():
         log_format=arguments.log.format,
         level=arguments.log.level,
     )
+
+    StateCollector.SKIP_INTERFACES = arguments.collector.skip_interface
 
     services = [
         MetricsAPI(
