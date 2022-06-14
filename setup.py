@@ -3,9 +3,12 @@ from setuptools import setup
 
 setup(
     name="lxd-exporter",
-    version="0.4.7",
+    version="0.4.8",
     include_package_data=True,
     license="Apache Software License",
+    description='prometheus exporter for LXD clusters',
+    long_description=open("README.md").read(),
+    long_description_content_type="text/markdown",
     author="Dmitry Orlov",
     author_email="me@mosquito.su",
     url="https://github.com/mosquito/lxd-exporter",
