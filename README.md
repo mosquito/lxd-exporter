@@ -24,8 +24,15 @@ Run it:
 ### From command line
 
 ```
-usage: lxd-exporter [-h] [--pool-size POOL_SIZE] [--log-level {debug,info,warning,error,critical}] [--log-format {stream,color,json,syslog,plain,journald,rich,rich_tb}] [--lxd-url LXD_URL] [--lxd-server-cert LXD_SERVER_CERT]
-                    [--lxd-client-cert LXD_CLIENT_CERT] [--lxd-client-key LXD_CLIENT_KEY] [--http-address HTTP_ADDRESS] [--http-port HTTP_PORT] [--collector-interval COLLECTOR_INTERVAL] [--collector-delay COLLECTOR_DELAY]
+usage: lxd-exporter [-h] [--pool-size POOL_SIZE]
+                    [--log-level {debug,info,warning,error,critical}]
+                    [--log-format {stream,color,json,syslog,plain,journald,rich,rich_tb}]
+                    [--lxd-url LXD_URL] [--lxd-server-cert LXD_SERVER_CERT]
+                    [--lxd-client-cert LXD_CLIENT_CERT]
+                    [--lxd-client-key LXD_CLIENT_KEY]
+                    [--http-address HTTP_ADDRESS] [--http-port HTTP_PORT]
+                    [--collector-interval COLLECTOR_INTERVAL]
+                    [--collector-delay COLLECTOR_DELAY]
                     [--collector-skip-interface COLLECTOR_SKIP_INTERFACE [COLLECTOR_SKIP_INTERFACE ...]]
 
 optional arguments:
@@ -40,7 +47,8 @@ Logging options:
                         (default: color) [ENV: LXD_EXPORTER_LOG_FORMAT]
 
 LXD options:
-  --lxd-url LXD_URL     (default: unix:///var/snap/lxd/common/lxd/unix.socket) [ENV: LXD_EXPORTER_LXD_URL]
+  --lxd-url LXD_URL     (default: unix:///var/snap/lxd/common/lxd/unix.socket)
+                        [ENV: LXD_EXPORTER_LXD_URL]
   --lxd-server-cert LXD_SERVER_CERT
                         [ENV: LXD_EXPORTER_LXD_SERVER_CERT]
   --lxd-client-cert LXD_CLIENT_CERT
@@ -60,10 +68,14 @@ Collector Service options:
   --collector-delay COLLECTOR_DELAY
                         (default: 0) [ENV: LXD_EXPORTER_COLLECTOR_DELAY]
   --collector-skip-interface COLLECTOR_SKIP_INTERFACE [COLLECTOR_SKIP_INTERFACE ...]
-                        (default: []) [ENV: LXD_EXPORTER_COLLECTOR_SKIP_INTERFACE]
+                        (default: []) [ENV:
+                        LXD_EXPORTER_COLLECTOR_SKIP_INTERFACE]
 
-Default values will based on following configuration files ['~/.config/lxd-exporter.ini', '/etc/lxd-exporter.ini']. Now 1 files has been applied ['/Users/mosquito/.config/lxd-exporter.ini']. The configuration files is INI-
-formatted files where configuration groups is INI sections.See more https://pypi.org/project/argclass/#configs
+Default values will based on following configuration files ['~/.config/lxd-
+exporter.ini', '/etc/lxd-exporter.ini']. Now 1 files has been applied
+['/Users/mosquito/.config/lxd-exporter.ini']. The configuration files is INI-
+formatted files where configuration groups is INI sections.See more
+https://pypi.org/project/argclass/#configs
 ```
 
 ### From config file
