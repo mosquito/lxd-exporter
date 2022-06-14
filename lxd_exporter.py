@@ -8,8 +8,9 @@ from abc import ABC
 from collections import Counter, defaultdict
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, FrozenSet, Iterable, Mapping, NamedTuple, Union, \
-    Optional
+from typing import (
+    Any, Dict, FrozenSet, Iterable, Mapping, NamedTuple, Optional, Union,
+)
 
 import aiohttp
 import argclass
@@ -30,7 +31,7 @@ NaN = float("NaN")
 
 class LxdGroup(argclass.Group):
     url: URL = argclass.Argument(
-        default="unix:///var/snap/lxd/common/lxd/unix.socket"
+        default="unix:///var/snap/lxd/common/lxd/unix.socket",
     )
     server_cert: Optional[Path]
     client_cert: Optional[Path]
@@ -55,7 +56,7 @@ class CollectorGroup(argclass.Group):
     delay: int = 0
     skip_interface: FrozenSet[str] = argclass.Argument(
         nargs=argclass.Nargs.ONE_OR_MORE, converter=frozenset,
-        default="[]"
+        default="[]",
     )
 
 
@@ -900,7 +901,7 @@ class CollectorService(PeriodicService):
                     )
 
     async def start(self):
-        if self.lxd_url.scheme == 'unix':
+        if self.lxd_url.scheme == "unix":
             path = Path(self.lxd_url.path)
 
             if not path.is_socket():
@@ -931,7 +932,7 @@ class CollectorService(PeriodicService):
         self._client = aiohttp.ClientSession(
             connector=connector,
             connector_owner=True,
-            raise_for_status=True
+            raise_for_status=True,
         )
 
         await super().start()
@@ -953,10 +954,12 @@ def main():
         level=arguments.log.level,
     )
 
-    logging.info(
-        "Network interfaces starts with %r will be skipped",
-        list(arguments.collector.skip_interface)
-    )
+    if arguments.collector.skip_interface:
+        logging.info(
+            "Network interfaces starts with %r will be skipped",
+            list(arguments.collector.skip_interface),
+        )
+
     StateCollector.SKIP_INTERFACES = arguments.collector.skip_interface
 
     services = [
