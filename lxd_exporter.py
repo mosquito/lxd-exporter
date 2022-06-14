@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import ssl
 import threading
@@ -941,7 +942,7 @@ def main():
         auto_env_var_prefix="LXD_EXPORTER_",
         config_files=[
             "~/.config/lxd-exporter.ini",
-            "/etc/lxd-exporter.ini",
+            os.getenv("LXD_EXPORTER_CONFIG", "/etc/lxd-exporter.ini"),
         ],
     )
     arguments.parse_args()
